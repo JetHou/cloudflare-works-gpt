@@ -3,6 +3,3 @@ dist
 .wrangler/state
 .wrangler/versions
 .wrangler/commands.json
-package-lock.json
-pnpm-lock.yaml
-yarn.lock
