@@ -1,116 +1,78 @@
-## Cloudflare GPT Proxy Worker
+## GraphQL GPT Cloudflare Worker
 
-This project exposes a small Cloudflare Worker that forwards chat-style requests to OpenAI's API. It is meant to sit behind your Cloudflare Pages frontend so that the browser never touches your OpenAI key directly.
+该 Worker 部署在 Cloudflare Workers/Pages 上，并通过 `https://api.jethoui7.online/graphql` 暴露 GraphQL 接口，负责把前端的聊天请求安全地代理到 OpenAI。
 
-### Prerequisites
+### 功能概览
 
-- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/) logged into the same Cloudflare account as your Pages project.
-- Node.js 18+ (only required if you want to edit TypeScript locally).
+- `_ping` 查询用于健康检查。
+- `chat` mutation 接收 `prompt` 字符串，调用 OpenAI `gpt-4o-mini`，返回 `role`、`content`、`createdAt`。
+- 统一的 GraphQL 错误结构，方便 React 前端消费。
 
-### Local development
+### 本地开发
 
 ```bash
 npm install
-wrangler dev
+wrangler dev --local
 ```
 
-Send a POST request to `http://127.0.0.1:8787` with either a `messages` array or a plain `prompt`:
+开发时可直接向 `http://127.0.0.1:8787/graphql` 发起请求：
 
 ```bash
-curl -X POST http://127.0.0.1:8787 \
+curl -X POST http://127.0.0.1:8787/graphql \
   -H "Content-Type: application/json" \
-  -d '{"prompt":"你好，Worker！"}'
+  -d '{"query":"mutation($prompt:String!){ chat(prompt:$prompt){ role content createdAt }}","variables":{"prompt":"你好，Cloudflare Worker！"}}'
 ```
 
-### Configure secrets
-
-Never hard-code your OpenAI key in the repo. Store it as a Worker secret:
+### 配置 OpenAI 密钥
 
 ```bash
 wrangler secret put OPENAI_API_KEY
-# paste: sk-proj-XXXXXXXXXXXXXXXXXXXXXXXXXXXX
+# 粘贴新的 sk- 开头的 key
 ```
 
-You can optionaly override the API base (for Azure/OpenAI compatible providers) by setting `OPENAI_BASE_URL` in `wrangler.toml` or via `wrangler secret/kv`.
-
-### Deploy to Cloudflare
+### 部署
 
 ```bash
 wrangler deploy
 ```
 
-- For a standalone Worker, the CLI output will show the public URL.
-- For a Pages project, go to **Pages → Settings → Functions** and connect this repo so the Worker runs as the Pages backend. Pages will detect `wrangler.toml` automatically.
+- 如果要绑定自定义域名 `api.jethoui7.online`，在 Cloudflare 控制台或 `wrangler.toml` 中配置对应的 routes/custom_domain，再将前端请求指向 `https://api.jethoui7.online/graphql`。
 
-### Request/response shape
-
-Request body (either `messages` or `prompt` is required):
-
-```json
-{
-  "model": "gpt-4o-mini",
-  "messages": [
-    { "role": "system", "content": "You are a helpful assistant." },
-    { "role": "user", "content": "用中文介绍一下 Cloudflare Workers。" }
-  ],
-  "temperature": 0.3,
-  "max_tokens": 300
-}
-```
-
-Response:
-
-```json
-{
-  "message": {
-    "role": "assistant",
-    "content": "..."
-  },
-  "usage": {
-    "prompt_tokens": 25,
-    "completion_tokens": 120,
-    "total_tokens": 145
-  },
-  "raw": { "...full OpenAI payload..." }
-}
-```
-
-### GraphQL endpoint
-
-The Worker also exposes `/graphql` for clients that prefer GraphQL. Example mutation:
+### GraphQL Schema
 
 ```graphql
-mutation Chat($prompt: String!) {
-  chat(
-    input: {
-      prompt: $prompt
-      system: "You are a helpful assistant."
-      model: "gpt-4o-mini"
-    }
-  ) {
-    message {
-      role
-      content
-    }
-    usage {
-      promptTokens
-      completionTokens
-      totalTokens
-    }
-  }
+type Query {
+  _ping: String!
+}
+
+type ChatMessage {
+  role: String!
+  content: String!
+  createdAt: String!
+}
+
+type Mutation {
+  chat(prompt: String!): ChatMessage!
 }
 ```
 
-Call it via `curl`:
+### 错误格式
 
-```bash
-curl -X POST https://<your-worker>/graphql \
-  -H "Content-Type: application/json" \
-  -d '{"query":"mutation Chat($prompt:String!){ chat(input:{ prompt:$prompt }) { message { role content } } }","variables":{"prompt":"介绍一下 Cloudflare Workers"}}'
+所有错误都会以 GraphQL 标准格式返回，例如：
+
+```json
+{
+  "data": null,
+  "errors": [
+    {
+      "message": "OPENAI_API_KEY is not configured",
+      "extensions": {
+        "status": 500,
+        "code": "OPENAI_CONFIG_MISSING"
+      }
+    }
+  ]
+}
 ```
 
-### Notes
-
-- CORS is enabled for `GET`, `POST`, and `OPTIONS`, so you can call the Worker directly from Pages or another frontend (REST or GraphQL).
-- `stream: true` is accepted but currently proxied as a standard JSON response. Add a streaming reader if you need Server-Sent Events in the future.
-- Remember to rotate and protect your `OPENAI_API_KEY`; anyone with the token can use your OpenAI quota.
+前端可以依赖 `errors[].extensions.status` 和 `errors[].extensions.code` 做进一步处理。

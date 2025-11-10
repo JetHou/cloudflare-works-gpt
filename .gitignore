@@ -1,35 +1,8 @@
-## Node
-node_modules/
-/.pnp/
-*.log
-
-## Build output
-dist/
-build/
-out/
-
-## TypeScript
-*.tsbuildinfo
-
-## OS
-.DS_Store
-
-## Editor
-.vscode/
-.idea/
-
-## Environment
-.env
-.env.*
-
-## Wrangler / Cloudflare
-.wrangler/
-/.wrangler/
-
-## pnpm
-/node_modules/.cache/
-
-## Misc
-coverage/
-.nyc_output/
-.parcel-cache/
+node_modules
+dist
+.wrangler/state
+.wrangler/versions
+.wrangler/commands.json
+package-lock.json
+pnpm-lock.yaml
+yarn.lock

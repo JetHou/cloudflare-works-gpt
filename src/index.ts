@@ -1,62 +1,122 @@
-import { buildSchema, graphql } from "graphql";
+import { GraphQLError, buildSchema, graphql } from "graphql";
 
 interface Env {
   OPENAI_API_KEY: string;
   OPENAI_BASE_URL?: string;
+  API_BASE_PATH?: string;
 }
 
 const DEFAULT_MODEL = "gpt-4o-mini";
+const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant.";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
-type ChatMessage = {
-  role: "system" | "user" | "assistant";
-  content: string;
-};
-
-type ChatPayload = {
-  messages?: ChatMessage[];
-  prompt?: string;
-  system?: string;
-  model?: string;
-  temperature?: number;
-  max_tokens?: number;
-  stream?: boolean;
-};
-
-type ChatUsage = {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-};
-
-type ChatResult = {
-  message: ChatMessage | null;
-  usage: ChatUsage | null;
-  raw: unknown;
-};
-
-type GraphQLChatInput = {
-  messages?: ChatMessage[];
-  prompt?: string;
-  system?: string;
-  model?: string;
-  temperature?: number;
-  maxTokens?: number;
-  stream?: boolean;
-};
-
-class HttpError extends Error {
+class WorkerError extends Error {
   status: number;
+  code: string;
 
-  constructor(message: string, status = 400) {
+  constructor(message: string, status = 400, code = "BAD_REQUEST") {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
+
+type GraphQLParams = {
+  query?: string;
+  variables?: Record<string, unknown>;
+  operationName?: string;
+};
+
+type ChatMessage = {
+  role: string;
+  content: string;
+  createdAt: string;
+};
+
+const schema = buildSchema(`
+  type Query {
+    _ping: String!
+  }
+
+  type ChatMessage {
+    role: String!
+    content: String!
+    createdAt: String!
+  }
+
+  type Mutation {
+    chat(prompt: String!): ChatMessage!
+  }
+`);
+
+async function callOpenAI(prompt: string, env: Env): Promise<ChatMessage> {
+  const trimmedPrompt = prompt?.trim();
+  if (!trimmedPrompt) {
+    throw new WorkerError("prompt is required", 400, "PROMPT_REQUIRED");
+  }
+
+  const apiKey = env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new WorkerError("OPENAI_API_KEY is not configured", 500, "OPENAI_CONFIG_MISSING");
+  }
+
+  const baseUrl = (env.OPENAI_BASE_URL ?? "https://api.openai.com").replace(/\/$/, "");
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: DEFAULT_MODEL,
+      messages: [
+        { role: "system", content: DEFAULT_SYSTEM_PROMPT },
+        { role: "user", content: trimmedPrompt }
+      ]
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new WorkerError(`OpenAI request failed: ${errorText}`, response.status, "OPENAI_ERROR");
+  }
+
+  const data = await response.json();
+  const choice = data.choices?.[0]?.message;
+  const createdTimestamp = data.created ? Number(data.created) * 1000 : Date.now();
+
+  return {
+    role: choice?.role ?? "assistant",
+    content: choice?.content ?? "",
+    createdAt: new Date(createdTimestamp).toISOString()
+  };
+}
+
+const rootValue = {
+  _ping: () => "pong",
+  chat: async ({ prompt }: { prompt: string }, context: { env: Env }) => {
+    try {
+      return await callOpenAI(prompt, context.env);
+    } catch (error) {
+      if (error instanceof WorkerError) {
+        throw new GraphQLError(error.message, {
+          extensions: {
+            code: error.code,
+            status: error.status
+          }
+        });
+      }
+
+      throw new GraphQLError("Unknown error", {
+        extensions: { code: "INTERNAL_ERROR", status: 500 }
+      });
+    }
+  }
+};
 
 const jsonResponse = (status: number, payload: unknown): Response =>
   new Response(JSON.stringify(payload, null, 2), {
@@ -67,182 +127,64 @@ const jsonResponse = (status: number, payload: unknown): Response =>
     }
   });
 
-async function runChat(body: ChatPayload, env: Env): Promise<ChatResult> {
-  if (!env.OPENAI_API_KEY) {
-    throw new HttpError("OPENAI_API_KEY is not configured", 500);
-  }
-
-  if (!body.messages && !body.prompt) {
-    throw new HttpError("Provide either `messages` or `prompt` in the request body");
-  }
-
-  const messages =
-    body.messages ??
-    [
-      body.system ? ({ role: "system", content: body.system } as ChatMessage) : null,
-      { role: "user", content: body.prompt ?? "" }
-    ].filter(Boolean) as ChatMessage[];
-
-  const baseUrl = (env.OPENAI_BASE_URL ?? "https://api.openai.com").replace(/\/$/, "");
-
-  const upstreamResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: body.model ?? DEFAULT_MODEL,
-      temperature: body.temperature ?? 0.2,
-      max_tokens: body.max_tokens,
-      stream: body.stream ?? false,
-      messages
-    })
-  });
-
-  if (!upstreamResponse.ok) {
-    const errorText = await upstreamResponse.text();
-    throw new HttpError(`OpenAI request failed: ${errorText}`, upstreamResponse.status);
-  }
-
-  const data = await upstreamResponse.json();
-  return {
-    message: data.choices?.[0]?.message ?? null,
-    usage: data.usage ?? null,
-    raw: data
-  };
-}
-
-async function handleJson(request: Request, env: Env): Promise<Response> {
-  let body: ChatPayload;
-  try {
-    body = (await request.json()) as ChatPayload;
-  } catch {
-    return jsonResponse(400, { error: "Request body must be valid JSON" });
-  }
-
-  try {
-    const result = await runChat(body, env);
-    return jsonResponse(200, result);
-  } catch (error) {
-    if (error instanceof HttpError) {
-      return jsonResponse(error.status, { error: error.message });
-    }
-    return jsonResponse(500, { error: "Unexpected error" });
-  }
-}
-
-const schema = buildSchema(`
-  type ChatMessage {
-    role: String!
-    content: String
-  }
-
-  type Usage {
-    promptTokens: Int
-    completionTokens: Int
-    totalTokens: Int
-  }
-
-  type ChatPayload {
-    message: ChatMessage
-    usage: Usage
-  }
-
-  input ChatMessageInput {
-    role: String!
-    content: String!
-  }
-
-  input ChatInput {
-    messages: [ChatMessageInput!]
-    prompt: String
-    system: String
-    model: String
-    temperature: Float
-    maxTokens: Int
-    stream: Boolean
-  }
-
-  type Query {
-    _empty: String
-  }
-
-  type Mutation {
-    chat(input: ChatInput!): ChatPayload!
-  }
-`);
-
-const rootValue = {
-  chat: async ({ input }: { input: GraphQLChatInput }, context: { env: Env }) => {
-    try {
-      const payload: ChatPayload = {
-        ...input,
-        max_tokens: input.maxTokens
-      };
-      const result = await runChat(payload, context.env);
-      return {
-        message: result.message,
-        usage: result.usage
-          ? {
-              promptTokens: result.usage.prompt_tokens ?? null,
-              completionTokens: result.usage.completion_tokens ?? null,
-              totalTokens: result.usage.total_tokens ?? null
-            }
-          : null
-      };
-    } catch (error) {
-      if (error instanceof HttpError) {
-        const graphQLError = new Error(error.message);
-        (graphQLError as Error & { extensions?: Record<string, unknown> }).extensions = {
-          status: error.status
-        };
-        throw graphQLError;
-      }
-      throw error;
-    }
-  }
-};
-
-type GraphQLParams = {
-  query?: string;
-  variables?: Record<string, unknown>;
-  operationName?: string;
-};
-
 async function parseGraphQLParams(request: Request): Promise<GraphQLParams> {
   if (request.method === "GET") {
     const url = new URL(request.url);
+    const query = url.searchParams.get("query") ?? undefined;
+    const operationName = url.searchParams.get("operationName") ?? undefined;
     const rawVariables = url.searchParams.get("variables");
-    let variables: Record<string, unknown> | undefined;
+
     if (rawVariables) {
       try {
-        variables = JSON.parse(rawVariables);
+        return {
+          query,
+          operationName,
+          variables: JSON.parse(rawVariables)
+        };
       } catch {
-        throw new HttpError("`variables` query param must be valid JSON");
+        throw new WorkerError("`variables` must be valid JSON", 400, "INVALID_VARIABLES");
       }
     }
-    return {
-      query: url.searchParams.get("query") ?? undefined,
-      operationName: url.searchParams.get("operationName") ?? undefined,
-      variables
-    };
+
+    return { query, operationName };
   }
 
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
-    return (await request.json()) as GraphQLParams;
+    try {
+      return (await request.json()) as GraphQLParams;
+    } catch {
+      throw new WorkerError("Request body must be valid JSON", 400, "INVALID_JSON");
+    }
   }
 
   const text = await request.text();
   return { query: text };
 }
 
+function normalizeGraphQLResult(result: Awaited<ReturnType<typeof graphql>>) {
+  const errors = result.errors?.map(error => ({
+    message: error.message,
+    locations: error.locations,
+    path: error.path,
+    extensions: {
+      status: error.extensions?.status ?? 500,
+      code: (error.extensions?.code as string | undefined) ?? "GRAPHQL_ERROR",
+      ...error.extensions
+    }
+  }));
+
+  return {
+    data: result.data ?? null,
+    ...(errors ? { errors } : {})
+  };
+}
+
 async function handleGraphQL(request: Request, env: Env): Promise<Response> {
   try {
     const params = await parseGraphQLParams(request);
     if (!params.query) {
-      return jsonResponse(400, { error: "GraphQL `query` is required" });
+      throw new WorkerError("GraphQL `query` is required", 400, "QUERY_REQUIRED");
     }
 
     const result = await graphql({
@@ -254,11 +196,42 @@ async function handleGraphQL(request: Request, env: Env): Promise<Response> {
       contextValue: { env }
     });
 
-    const status = result.errors ? 400 : 200;
-    return jsonResponse(status, result);
+    const payload = normalizeGraphQLResult(result);
+    const status = result.errors?.[0]?.extensions?.status
+      ? Number(result.errors[0].extensions.status)
+      : result.errors
+        ? 400
+        : 200;
+
+    return jsonResponse(status, payload);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "GraphQL execution failed";
-    return jsonResponse(400, { error: message });
+    if (error instanceof WorkerError) {
+      return jsonResponse(error.status, {
+        data: null,
+        errors: [
+          {
+            message: error.message,
+            extensions: {
+              status: error.status,
+              code: error.code
+            }
+          }
+        ]
+      });
+    }
+
+    return jsonResponse(500, {
+      data: null,
+      errors: [
+        {
+          message: error instanceof Error ? error.message : "GraphQL execution failed",
+          extensions: {
+            status: 500,
+            code: "INTERNAL_ERROR"
+          }
+        }
+      ]
+    });
   }
 }
 
@@ -268,20 +241,33 @@ const worker: ExportedHandler<Env> = {
       return new Response(null, { headers: corsHeaders });
     }
 
-    const { pathname } = new URL(request.url);
-    if (pathname === "/graphql") {
-      return handleGraphQL(request, env);
+    const url = new URL(request.url);
+    const graphqlPath = env.API_BASE_PATH ?? "/graphql";
+    if (url.pathname !== graphqlPath) {
+      return jsonResponse(404, {
+        data: null,
+        errors: [
+          {
+            message: "Not Found",
+            extensions: { status: 404, code: "NOT_FOUND" }
+          }
+        ]
+      });
     }
 
-    if (request.method === "POST") {
-      return handleJson(request, env);
+    if (request.method !== "GET" && request.method !== "POST") {
+      return jsonResponse(405, {
+        data: null,
+        errors: [
+          {
+            message: "Only GET/POST are supported",
+            extensions: { status: 405, code: "METHOD_NOT_ALLOWED" }
+          }
+        ]
+      });
     }
 
-    return jsonResponse(200, {
-      status: "ok",
-      message:
-        "POST JSON to / for REST style chat completions or send GraphQL queries to /graphql."
-    });
+    return handleGraphQL(request, env);
   }
 };
 
