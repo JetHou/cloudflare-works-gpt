@@ -1,0 +1,5 @@
+name = "mcp-test-backend-gpt"
+main = "src/index.ts"
+compatibility_date = "2024-05-29"
+
+

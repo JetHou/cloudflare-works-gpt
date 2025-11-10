@@ -1,0 +1,35 @@
+## Node
+node_modules/
+/.pnp/
+*.log
+
+## Build output
+dist/
+build/
+out/
+
+## TypeScript
+*.tsbuildinfo
+
+## OS
+.DS_Store
+
+## Editor
+.vscode/
+.idea/
+
+## Environment
+.env
+.env.*
+
+## Wrangler / Cloudflare
+.wrangler/
+/.wrangler/
+
+## pnpm
+/node_modules/.cache/
+
+## Misc
+coverage/
+.nyc_output/
+.parcel-cache/
